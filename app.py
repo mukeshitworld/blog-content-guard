@@ -7,6 +7,8 @@ from difflib import SequenceMatcher
 
 # --- Config ---
 TOOL_NAME = "Bluehost Blog ContentGuard"
+CACHE_TTL = 86400  # 24 hours
+
 SITEMAPS = [
     "https://www.bluehost.com/blog/post-sitemap.xml",
     "https://www.bluehost.com/blog/post-sitemap2.xml",
@@ -20,11 +22,23 @@ SITEMAPS = [
     "https://www.bluehost.com/blog/post-sitemap10.xml"
 ]
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive"
+}
+
 st.set_page_config(page_title=TOOL_NAME, page_icon="🛡️", layout="wide")
 st.title(f"🛡️ {TOOL_NAME}")
 st.caption("Duplicate & topic detection using sitemap inventory")
 
-# --- URL Filters ---
+# --- Manual Cache Refresh ---
+if st.button("🔄 Refresh Sitemap Cache"):
+    st.cache_data.clear()
+    st.success("Cache cleared. Next audit will fetch fresh sitemap data.")
+
+# --- Filters ---
 def is_valid_blog_post(url):
     return (
         "/blog/" in url
@@ -35,19 +49,32 @@ def is_valid_blog_post(url):
         and "/in/blog/" not in url
     )
 
-# --- Fetch Sitemap URLs ---
-@st.cache_data(ttl=360000)
+# --- Sitemap Fetch ---
+@st.cache_data(ttl=CACHE_TTL)
 def get_all_blog_urls():
-    headers = {"User-Agent": "Mozilla/5.0 (SEO-ContentGuard)"}
     urls = []
 
     for sitemap in SITEMAPS:
-        try:
-            resp = requests.get(sitemap, headers=headers, timeout=10)
-            soup = BeautifulSoup(resp.text, "xml")
-            urls.extend([loc.text for loc in soup.find_all("loc")])
-        except:
-            pass
+        success = False
+
+        for attempt in range(3):
+            try:
+                resp = requests.get(sitemap, headers=HEADERS, timeout=15)
+
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, "lxml-xml")
+                    urls.extend([loc.text for loc in soup.find_all("loc")])
+                    success = True
+                    break
+
+                else:
+                    time.sleep(2)
+
+            except Exception:
+                time.sleep(2)
+
+        if not success:
+            st.warning(f"⚠ Could not fetch sitemap: {sitemap}")
 
     clean_urls = [u for u in urls if is_valid_blog_post(u)]
     return list(set(clean_urls))
@@ -72,51 +99,33 @@ if st.button("Run Blog Audit"):
         keywords = [k.strip().lower() for k in raw_input.split(",") if k.strip()]
         results = []
 
-        with st.spinner("Fetching blog sitemap inventory..."):
+        with st.spinner("Loading blog inventory..."):
             blog_urls = get_all_blog_urls()
+
+        st.caption(f"Loaded {len(blog_urls)} blog URLs")
 
         progress = st.progress(0)
 
         for i, kw in enumerate(keywords):
-
             keyword_slug = kw.replace(" ", "-")
 
-            # 1) Exact slug match
-            exact_matches = [
-                u for u in blog_urls
-                if u.rstrip("/").split("/")[-1] == keyword_slug
-            ]
+            exact = [u for u in blog_urls if u.rstrip("/").split("/")[-1] == keyword_slug]
+            partial = [u for u in blog_urls if keyword_slug in u and u not in exact]
 
-            # 2) Partial slug match
-            partial_matches = [
-                u for u in blog_urls
-                if keyword_slug in u and u not in exact_matches
-            ]
-
-            # 3) Semantic similarity
-            semantic_matches = []
-            if not exact_matches and not partial_matches:
+            semantic = []
+            if not exact and not partial:
                 for u in blog_urls:
-                    slug_text = extract_slug(u)
-                    if similarity(slug_text, kw) > 0.7:
-                        semantic_matches.append(u)
+                    if similarity(extract_slug(u), kw) > 0.7:
+                        semantic.append(u)
 
-            # --- Decision ---
-            if exact_matches:
-                match = exact_matches[0]
-                status = "❌ Duplicate (Exact Slug)"
-
-            elif partial_matches:
-                match = partial_matches[0]
-                status = "❌ Duplicate (Partial Slug)"
-
-            elif semantic_matches:
-                match = semantic_matches[0]
-                status = "⚠ Similar Topic Exists"
-
+            if exact:
+                match, status = exact[0], "❌ Duplicate (Exact Slug)"
+            elif partial:
+                match, status = partial[0], "❌ Duplicate (Partial Slug)"
+            elif semantic:
+                match, status = semantic[0], "⚠ Similar Topic Exists"
             else:
-                match = None
-                status = "✅ Clear"
+                match, status = None, "✅ Clear"
 
             results.append({
                 "Keyword": kw,
@@ -126,7 +135,6 @@ if st.button("Run Blog Audit"):
             })
 
             progress.progress((i + 1) / len(keywords))
-            time.sleep(0.1)
 
         # --- Display ---
         df = pd.DataFrame(results)
